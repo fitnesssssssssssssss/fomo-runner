@@ -1,0 +1,31 @@
+name: fomo-fetch
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: fomo-fetch
+  cancel-in-progress: false
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install curl_cffi
+      - name: Fetch cycle
+        env:
+          FOMO_PIPELINE_KEY: ${{ secrets.FOMO_PIPELINE_KEY }}
+        run: python runner.py
+      - name: Commit state
+        if: always()
+        run: |
+          git config user.name "fomo-runner"
+          git config user.email "[runner@users.noreply.github.com](mailto:runner@users.noreply.github.com)"
+          git add state/ || true
+          git diff --cached --quiet || (git commit -m "state update" && git push)
