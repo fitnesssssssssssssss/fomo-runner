@@ -68,6 +68,16 @@ def kheaders():
 
 # ---------- state ----------
 
+def log_gap_repo(reason, pause_min):
+    """Persist a backoff window to the repo state dir (visible to the daily report
+    and the heartbeat's expected-backoff check). fp.log_gap alone writes to the
+    sandbox path, which does not exist on GitHub Actions."""
+    gaps = load_state('gaps.json', [])
+    gaps.append({'at': datetime.now(timezone.utc).isoformat(),
+                 'reason': reason, 'pause_min': round(pause_min, 1)})
+    save_state('gaps.json', gaps[-200:])
+
+
 def load_state(name, default):
     p = os.path.join(STATE_DIR, name)
     try:
@@ -430,9 +440,15 @@ def main():
                 sys.exit(0 if ok else 1)
         except fp.BotBlock as b:
             pause = random.uniform(30, 45)
-            fp.log_gap(str(b), pause)
-            log(f"BOT-BLOCK: {b} — would pause {pause:.0f} min (gap logged)")
-            sys.exit(0)  # expected failure: green run, next schedule retries
+            log_gap_repo(str(b), pause)  # repo state/gaps.json — visible to reports + heartbeat
+            if args.loop:
+                # Loop mode (VPS/systemd): actually back off, do NOT exit — a clean
+                # exit would stop systemd from restarting the daemon.
+                log(f"BOT-BLOCK: {b} — pausing {pause:.0f} min (gap logged)")
+                time.sleep(pause * 60)
+                continue
+            log(f"BOT-BLOCK: {b} — would pause {pause:.0f} min (gap logged to state/gaps.json)")
+            sys.exit(0)  # once mode: green run, next GitHub schedule retries
         except RuntimeError as e:
             log(f"FATAL: {e}")
             sys.exit(1)
