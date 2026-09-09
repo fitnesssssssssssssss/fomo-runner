@@ -21,6 +21,21 @@ analyze_clan, BotBlock handling). Differences from the sandbox pipeline:
     the gated storePaperTrades function for the 6-hourly/daily reports.
     Non-memes (WETH, SOL, stables, tokenized stocks) are skipped by design.
 
+v3 (2026-09-09):
+  * Sim upgrade: majority timestamps (state/majority_log.json) — legacy positions
+    (majority formed before v3) are no longer aped unless they show fresh bullish
+    validation (holders rising + net buy flow + no recent whale profit-taking).
+  * Majority-sell exit: if >=2 distinct members (or >=30% of a meme's holders, or
+    sell volume >=20% of the clan's holding value) sell within 6h while we are
+    below the 2x target, we exit with reason 'majority_sell_exit' — mirroring the
+    clan majority instead of riding it down.
+  * Fee model: 1% per side (DEX fee + slippage) applied to entries, exits, and marks.
+  * Flow log: state/meme_flow.json (48h rolling buy/sell window per token, built
+    from the events we already fetch — zero extra fomo requests).
+  * Leaderboard + @rasmr watchlist: hourly probe of leaderboard API candidates
+    (results + diagnostics stored via gated storeLeaderData for the reports to
+    surface; free platform-side, no agent steps).
+
 Exit codes: 0 = ok (or expected bot-block), 1 = failure (visible in Actions).
 """
 import argparse
@@ -41,6 +56,7 @@ AUTH_URL = 'https://elara-0ec48c47.base44.app/functions/authState'
 BACKEND_URL = 'https://elara-0ec48c47.base44.app/functions/storeClanData'
 TRADE_STORE_URL = 'https://elara-0ec48c47.base44.app/functions/storeTradeEvents'
 PAPER_STORE_URL = 'https://elara-0ec48c47.base44.app/functions/storePaperTrades'
+LEADER_STORE_URL = 'https://elara-0ec48c47.base44.app/functions/storeLeaderData'
 SEEN_CAP = fp.MAX_SEEN
 
 # ---- paper trading config (defaults confirmed by owner 2026-09-06) ----
@@ -51,6 +67,9 @@ PAPER_STOP_PCT = float(os.environ.get('FOMO_PAPER_STOP', '-50'))        # -50% s
 SKIP_SYMBOLS = {'WETH', 'SOL', 'WSOL', 'USDC', 'USDT', 'DAI', 'PYUSD', 'WBTC', 'WSTETH',
                 'CBBTC', 'USDE', 'USDS', 'WSTETH', 'STETH', 'RETH', 'CBETH'}
 SKIP_NAME_MARKERS = ('robinhood token', 'backed',)
+PAPER_FEE_PCT = float(os.environ.get('FOMO_PAPER_FEE', '1.0'))   # 1% per side (fee + slippage)
+WATCH_HANDLE = os.environ.get('FOMO_WATCH_HANDLE', 'rasmr').lower()
+LEADER_MIN_INTERVAL = 55 * 60  # leaderboard fetch at most hourly (with natural cron jitter)
 
 KEY = os.environ.get('FOMO_PIPELINE_KEY', fp.PIPELINE_KEY)
 if not KEY:
@@ -158,7 +177,7 @@ def get_valid_token(s):
     return blob['token']
 
 
-# ---------- paper trading simulator ----------
+# ---------- paper trading simulator v3 ----------
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -179,8 +198,73 @@ def _is_nonmeme(h):
     return sym in SKIP_SYMBOLS or any(m in name for m in SKIP_NAME_MARKERS)
 
 
+def _pnl_pct(exit_idx, entry_idx):
+    """Mark-to-market including the 1%-per-side fee model (fee + slippage)."""
+    if not entry_idx:
+        return 0.0
+    f = PAPER_FEE_PCT / 100.0
+    return (exit_idx * (1 - f) / (entry_idx * (1 + f)) - 1) * 100.0
+
+
+def _flow_key(clan_id, addr):
+    return f"{clan_id}|{addr}"
+
+
+def _flow_update(all_events, flow):
+    """Accumulate per-token buy/sell flow from this cycle's NEW events (no extra
+    fomo requests — built from the events the fetch already returned). Prune 48h."""
+    now_ts = time.time()
+    for ev in all_events or []:
+        typ = ev.get('type', '')
+        if typ in ('large_buy', 'multi_user_buy'):
+            side, pnl = 'buy', None
+        elif typ in ('large_sell', 'multi_user_sell'):
+            side, pnl = 'sell', (ev.get('percentPnl') or 0)
+        else:
+            continue
+        k = _flow_key(ev.get('clanId', ''), ev.get('tokenAddress', ''))
+        flow.setdefault(k, []).append({
+            'ts': now_ts, 'side': side, 'user': ev.get('userHandle', ''),
+            'usd': ev.get('positionSizeUsd') or 0, 'pnl': pnl})
+    for k in list(flow.keys()):
+        flow[k] = [f for f in flow[k] if now_ts - f['ts'] <= 48 * 3600][-60:]
+        if not flow[k]:
+            del flow[k]
+
+
+def _flow_since(flow, clan_id, addr, hours):
+    now_ts = time.time()
+    return [f for f in flow.get(_flow_key(clan_id, addr), [])
+            if now_ts - f['ts'] <= hours * 3600]
+
+
+def _bullish_gate(info, flow48, flow24, holders, prev_holders):
+    """Entry gate (owner rules 2026-09-08):
+    - never ape a legacy majority (formed before v3 tracking, never dropped out)
+      unless it shows fresh bullish validation: holders rising + net buy flow
+      + >=2 buys in 48h;
+    - fresh majority crossings pass on basic health;
+    - nobody gets entered while holders are shrinking or a whale is profit-taking
+      (+150% or better sell in the last 24h = distribution marker).
+    Returns (ok, reason)."""
+    for f in flow24:
+        if f['side'] == 'sell' and (f.get('pnl') or 0) >= 150:
+            return False, 'whale profit-taking within 24h'
+    if info and info.get('sellExitAt') and time.time() - info['sellExitAt'] < 48 * 3600:
+        return False, 'majority-sell exit cooldown (48h)'
+    if prev_holders is not None and holders < prev_holders:
+        return False, 'holder count shrinking'
+    if info and info.get('wasLegacy') and not info.get('reCrossed'):
+        buys48 = [f for f in flow48 if f['side'] == 'buy']
+        net = sum(f['usd'] for f in buys48) - \
+              sum(f['usd'] for f in flow48 if f['side'] == 'sell')
+        if len(buys48) < 2 or net <= 0:
+            return False, 'legacy majority without fresh accumulation'
+    return True, ''
+
+
 def _paper_close(port, pos, exit_idx, reason, now, actions):
-    pnl_pct = (exit_idx / pos['entryPriceIdx'] - 1) * 100 if pos['entryPriceIdx'] else 0.0
+    pnl_pct = _pnl_pct(exit_idx, pos['entryPriceIdx'])
     pnl_usd = pos['sizeUsd'] * (pnl_pct / 100.0)
     port['wallets'][pos['clan']] = port['wallets'].get(pos['clan'], 0) + pos['sizeUsd'] + pnl_usd
     port['positions'].remove(pos)
@@ -198,12 +282,12 @@ def _paper_close(port, pos, exit_idx, reason, now, actions):
         f"pnl={pnl_pct:+.1f}% (${pnl_usd:+.2f}) wallet=${port['wallets'][pos['clan']]:.2f}")
 
 
-def run_paper_cycle(raw_clans, s):
-    """Simulate the majority-follow strategy on this cycle's fresh data.
+def run_paper_cycle(raw_clans, s, all_events):
+    """Simulate the majority-follow strategy on this cycle's fresh data (v3).
 
-    raw_clans: list of raw clan dicts ({'name','info','holdings'}) for fetches that
-    succeeded. Uses only data already fetched — zero extra fomo requests.
-    """
+    raw_clans: list of raw clan dicts ({'id','name','info','holdings'}) for fetches
+    that succeeded. all_events: this cycle's NEW trade events (builds the 48h flow
+    log). Uses only data already fetched — zero extra fomo requests."""
     if not raw_clans:
         return
     port = load_state('paper_portfolio.json', None)
@@ -212,18 +296,24 @@ def run_paper_cycle(raw_clans, s):
                 'positions': [], 'closed': [], 'started': _now_iso()}
         log(f"Paper portfolio initialized: {len(port['wallets'])} x ${PAPER_WALLET_USD:.0f} wallets")
 
+    mlog = load_state('majority_log.json', None)
+    if mlog is None:
+        mlog = {'clans': {}}
+    flow = load_state('meme_flow.json', {})
+    _flow_update(all_events, flow)
+
     actions = []
     exited_this_cycle = set()
     now = _now_iso()
 
     for clan in raw_clans:
         name = clan['name']
+        clan_id = clan.get('id') or name
         members = (clan.get('info') or {}).get('memberCount', 0) or 0
         if members < 2:
             continue
         half = members / 2.0
 
-        # Price index + metadata for every priceable holding
         price, meta = {}, {}
         for h in clan.get('holdings', []):
             addr = h.get('tokenAddress')
@@ -232,8 +322,38 @@ def run_paper_cycle(raw_clans, s):
                 price[addr] = idx
                 meta[addr] = h
 
-        # Majority = held by strictly more than half the clan's members
         majority = {a for a, h in meta.items() if (h.get('memberCount') or 0) > half}
+
+        # ---- majority log: timestamps, legacy flags, re-cross detection ----
+        clog = mlog['clans'].setdefault(clan_id, {'legacyDone': False, 'tokens': {}})
+        toks = clog['tokens']
+        for a, ent in toks.items():
+            if a not in majority and ent.get('droppedAt') is None:
+                ent['droppedAt'] = now
+        for a in majority:
+            ent = toks.get(a)
+            if ent is None:
+                toks[a] = {'symbol': meta[a].get('symbol', ''), 'holders': meta[a].get('memberCount') or 0,
+                           'prevHolders': None, 'firstAt': now, 'droppedAt': None,
+                           'wasLegacy': False, 'reCrossed': False}
+                log(f"MAJORITY LOG {name}: fresh majority {meta[a].get('symbol')}")
+            else:
+                ent['prevHolders'] = ent.get('holders')
+                ent['holders'] = meta[a].get('memberCount') or 0
+                if ent.get('droppedAt'):
+                    ent['droppedAt'] = None
+                    if ent.get('sellExitAt'):
+                        ent['sellExitAt'] = None
+                        log(f"MAJORITY LOG {name}: {ent.get('symbol')} re-crossed — majority-sell cooldown cleared")
+                    if not ent.get('reCrossed'):
+                        ent['reCrossed'] = True
+                        log(f"MAJORITY LOG {name}: {ent.get('symbol')} re-crossed into majority")
+        if not clog['legacyDone']:
+            for a in majority:
+                toks[a]['wasLegacy'] = True
+            clog['legacyDone'] = True
+            log(f"MAJORITY LOG {name}: legacy init — {len(majority)} existing majority meme(s) "
+                f"marked legacy (no fresh entries without bullish validation)")
 
         # ---- exits first (frees wallet cash) ----
         for pos in [p for p in port['positions'] if p['clan'] == name]:
@@ -241,24 +361,38 @@ def run_paper_cycle(raw_clans, s):
             idx = price.get(addr)
             if idx is not None:
                 pos['lastIdx'] = idx
-                pnl_pct = (idx / pos['entryPriceIdx'] - 1) * 100
+                pnl_pct = _pnl_pct(idx, pos['entryPriceIdx'])
                 if pnl_pct >= PAPER_TARGET_PCT:
                     exited_this_cycle.add((name, addr))
                     _paper_close(port, pos, idx, 'target_2x', now, actions)
                 elif pnl_pct <= PAPER_STOP_PCT:
                     exited_this_cycle.add((name, addr))
                     _paper_close(port, pos, idx, 'stop_-50', now, actions)
-                elif addr not in majority:
-                    exited_this_cycle.add((name, addr))
-                    _paper_close(port, pos, idx, 'majority_exit', now, actions)
+                else:
+                    # majority-sell exit: visible distribution while below target
+                    h = meta.get(addr) or {}
+                    holders = h.get('memberCount') or 0
+                    flow6 = _flow_since(flow, clan_id, addr, 6)
+                    sellers = {f['user'] for f in flow6 if f['side'] == 'sell' and f['user']}
+                    sell_usd = sum(f['usd'] for f in flow6 if f['side'] == 'sell')
+                    hval = h.get('value') or 0
+                    need = max(2, int(0.3 * holders + 0.999)) if holders else 2
+                    if len(sellers) >= need or (hval > 0 and sell_usd >= 0.2 * hval):
+                        exited_this_cycle.add((name, addr))
+                        toks.setdefault(addr, {}).update(
+                            {'symbol': pos['symbol'], 'sellExitAt': time.time()})
+                        _paper_close(port, pos, idx, 'majority_sell_exit', now, actions)
+                        log(f"  majority-sell signal: {len(sellers)} seller(s) "
+                            f"({', '.join(sorted(sellers))}) in 6h, need {need}")
+                    elif addr not in majority:
+                        exited_this_cycle.add((name, addr))
+                        _paper_close(port, pos, idx, 'majority_exit', now, actions)
             else:
-                # Meme vanished from the clan's holdings entirely -> majority gone.
-                # Close at the last price we saw.
                 last = pos.get('lastIdx') or pos['entryPriceIdx']
                 exited_this_cycle.add((name, addr))
                 _paper_close(port, pos, last, 'majority_exit', now, actions)
 
-        # ---- entries ----
+        # ---- entries (gated) ----
         for addr in sorted(majority):
             h = meta[addr]
             if _is_nonmeme(h):
@@ -269,6 +403,15 @@ def run_paper_cycle(raw_clans, s):
                 continue  # cooldown: no same-cycle re-entry after an exit
             if port['wallets'].get(name, 0) < PAPER_TRADE_USD:
                 continue
+            info = toks.get(addr)
+            flow48 = _flow_since(flow, clan_id, addr, 48)
+            flow24 = _flow_since(flow, clan_id, addr, 24)
+            ok, why = _bullish_gate(info, flow48, flow24,
+                                    h.get('memberCount') or 0,
+                                    info.get('prevHolders') if info else None)
+            if not ok:
+                log(f"PAPER SKIP {name}: {h.get('symbol')} — {why}")
+                continue
             port['wallets'][name] -= PAPER_TRADE_USD
             pos = {'pid': f"{name}|{addr}|{now}", 'clan': name, 'symbol': h.get('symbol', ''),
                    'tokenAddress': addr, 'networkId': h.get('networkId', 0), 'openedAt': now,
@@ -278,9 +421,9 @@ def run_paper_cycle(raw_clans, s):
             log(f"PAPER BUY {name}: ${PAPER_TRADE_USD:.0f} {h.get('symbol')} "
                 f"@idx {price[addr]:.4e} wallet=${port['wallets'][name]:.2f}")
 
-        # ---- marks for remaining open positions ----
+        # ---- marks for remaining open positions (fee-adjusted) ----
         for pos in [p for p in port['positions'] if p['clan'] == name]:
-            mark_pct = (pos.get('lastIdx', pos['entryPriceIdx']) / pos['entryPriceIdx'] - 1) * 100
+            mark_pct = _pnl_pct(pos.get('lastIdx', pos['entryPriceIdx']), pos['entryPriceIdx'])
             actions.append({'type': 'mark', 'pid': pos['pid'], 'lastMarkPct': round(mark_pct, 2)})
 
     if actions:
@@ -295,12 +438,147 @@ def run_paper_cycle(raw_clans, s):
             log(f"Paper store error (portfolio state still saved locally): {e}")
 
     save_state('paper_portfolio.json', port)
+    save_state('majority_log.json', mlog)
+    save_state('meme_flow.json', flow)
     open_pos = len(port['positions'])
-    open_pnl = sum((p.get('lastIdx', p['entryPriceIdx']) / p['entryPriceIdx'] - 1) * p['sizeUsd']
-                   for p in port['positions'] if p['entryPriceIdx'])
+    open_pnl = sum(pos['sizeUsd'] * _pnl_pct(pos.get('lastIdx', pos['entryPriceIdx']),
+                                             pos['entryPriceIdx']) / 100.0
+                   for pos in port['positions'] if pos['entryPriceIdx'])
     log(f"Paper book: {open_pos} open, {len(port['closed'])} closed, "
-        f"unrealized ${open_pnl:+.2f}")
+        f"unrealized ${open_pnl:+.2f} (1%/side fee model)")
 
+
+# ---------- leaderboard + watchlist fetch (v3) ----------
+
+LEADER_CANDIDATES = [
+    'https://prod-api.fomo.family/v2/leaderboard?limit=25',
+    'https://prod-api.fomo.family/v2/leaderboards?limit=25',
+    'https://prod-api.fomo.family/v2/leaderboard/all?limit=25',
+    'https://prod-api.fomo.family/v2/users/leaderboard?scope=all&limit=25',
+]
+USER_PROBE_TEMPLATES = [
+    'https://prod-api.fomo.family/v2/users?handle={h}',
+    'https://prod-api.fomo.family/v2/users/handle/{h}',
+    'https://prod-api.fomo.family/v2/users/{h}',
+]
+
+
+def _leader_store(s, items):
+    """Best-effort store of LeaderData items; never fails the cycle."""
+    try:
+        r = s.post(LEADER_STORE_URL, json={'items': items}, headers=kheaders(),
+                   impersonate='chrome', timeout=60)
+        log(f"Leader store: {r.status_code} items={len(items)}")
+    except Exception as e:
+        log(f"Leader store error (non-fatal): {e}")
+
+
+def _find_watch_user(obj, handle):
+    """Walk a JSON payload for the first dict whose string fields mention the
+    watchlist handle (case-insensitive). Returns the dict or None."""
+    target = handle.lower()
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for v in cur.values():
+                if isinstance(v, str) and target in v.lower():
+                    return cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def fetch_leader_and_rasmr(s, token):
+    """Hourly: probe leaderboard endpoints (auth'd, paced) and fetch the watchlist
+    profile (@rasmr). All results + probe diagnostics go to LeaderData via the
+    gated storeLeaderData function so reports can surface them. Free: no LLM,
+    no agent steps. BotBlocks bubble up so the cycle-level gap handling fires."""
+    meta = load_state('leader_meta.json', {})
+    now_ts = time.time()
+    if now_ts - (meta.get('lastFetch') or 0) < LEADER_MIN_INTERVAL:
+        return
+    meta['lastFetch'] = now_ts
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json',
+               'Origin': 'https://fomo.family', 'Referer': 'https://fomo.family/'}
+    now = _now_iso()
+    probes, payload, ok_url = [], None, None
+
+    for url in LEADER_CANDIDATES:
+        try:
+            r = s.get(url, headers=headers, impersonate='chrome', timeout=30)
+            probes.append({'url': url.split('?')[0], 'status': r.status_code})
+            if r.status_code in fp.BLOCK_STATUSES:
+                raise fp.BotBlock(f"leader probe HTTP {r.status_code}")
+            if r.status_code == 200:
+                d = r.json()
+                ro = d.get('responseObject') if isinstance(d, dict) else d
+                if ro:
+                    payload, ok_url = d, url
+                    log(f"Leaderboard fetch OK via {url.split('?')[0]}")
+                    break
+            time.sleep(random.uniform(1.5, 3.0))
+        except fp.BotBlock:
+            raise
+        except Exception as e:
+            probes.append({'url': url.split('?')[0], 'error': str(e)[:80]})
+            time.sleep(random.uniform(1.5, 3.0))
+
+    items = []
+    if payload is not None:
+        meta['lastOkUrl'] = ok_url
+        items.append({'key': 'leaderboard_all',
+                      'payload': json.dumps(payload)[:200000],
+                      'fetchedAt': now,
+                      'note': f"endpoint: {ok_url}; probe results: {json.dumps(probes)[:600]}"})
+        wuser = _find_watch_user(payload, WATCH_HANDLE)
+        wsrc = 'leaderboard entry'
+    else:
+        meta['lastOkUrl'] = None
+        items.append({'key': 'leaderboard_probe',
+                      'payload': json.dumps({'probes': probes}),
+                      'fetchedAt': now,
+                      'note': 'all candidate endpoints failed — probe diagnostics for iteration'})
+        wuser, wsrc = None, None
+
+    if wuser is None:
+        for tpl in USER_PROBE_TEMPLATES:
+            url = tpl.format(h=WATCH_HANDLE)
+            try:
+                r = s.get(url, headers=headers, impersonate='chrome', timeout=30)
+                probes.append({'url': url.split('?')[0], 'status': r.status_code})
+                if r.status_code in fp.BLOCK_STATUSES:
+                    raise fp.BotBlock(f"watchlist probe HTTP {r.status_code}")
+                if r.status_code == 200:
+                    d = r.json()
+                    ro = d.get('responseObject') if isinstance(d, dict) else d
+                    cand = _find_watch_user(d, WATCH_HANDLE) or (ro if ro else None)
+                    if cand:
+                        wuser, wsrc = cand, url
+                        log(f"Watchlist {WATCH_HANDLE}: found via {url.split('?')[0]}")
+                        break
+                time.sleep(random.uniform(1.5, 3.0))
+            except fp.BotBlock:
+                raise
+            except Exception as e:
+                probes.append({'url': url.split('?')[0], 'error': str(e)[:80]})
+                time.sleep(random.uniform(1.5, 3.0))
+
+    if wuser is not None:
+        items.append({'key': f'profile:{WATCH_HANDLE}',
+                      'payload': json.dumps(wuser)[:100000],
+                      'fetchedAt': now,
+                      'note': f"source: {wsrc}"})
+    else:
+        items.append({'key': f'profile:{WATCH_HANDLE}',
+                      'payload': json.dumps({'found': False, 'probes': probes[-6:]}),
+                      'fetchedAt': now,
+                      'note': 'not found yet — endpoint probes logged for iteration'})
+
+    meta['probes'] = probes[-12:]
+    _leader_store(s, items)
+    save_state('leader_meta.json', meta)
 
 # ---------- one cycle ----------
 
@@ -407,9 +685,19 @@ def run_cycle(s, token, dry=False):
 
     # ---- paper trading simulator (uses this cycle's raw data; no new fomo calls) ----
     try:
-        run_paper_cycle(raw_ok, s)
+        run_paper_cycle(raw_ok, s, all_events)
     except Exception as e:
         log(f"Paper sim error (non-fatal): {e}")
+
+    # ---- leaderboard + @rasmr watchlist (hourly, free: no fomo load beyond probes) ----
+    try:
+        fetch_leader_and_rasmr(s, token)
+    except fp.BotBlock as b:
+        pause = random.uniform(30, 45)
+        log_gap_repo(f"leader fetch bot-block: {b}", pause)
+        log(f"LEADER BOT-BLOCK: {b} — gap logged, retry next cycle")
+    except Exception as e:
+        log(f"Leader fetch error (non-fatal): {e}")
 
     return all_ok
 
