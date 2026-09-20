@@ -36,6 +36,20 @@ v3 (2026-09-09):
     (results + diagnostics stored via gated storeLeaderData for the reports to
     surface; free platform-side, no agent steps).
 
+v4 (2026-09-20) — profitability upgrade (all changes inside the free runner/sim):
+  * Entry confirmation: a fresh majority must hold PAPER_CONFIRM_CYCLES consecutive
+    cycles before we buy (kills marginal-majority churn).
+  * Exit confirmation: majority_exit only after the meme has been out of the
+    majority for PAPER_EXIT_CONFIRM_CYCLES consecutive cycles (majority-sell
+    distribution exit stays immediate; targets/stops stay immediate).
+  * Conviction sizing: $75 marginal single-clan (<60% of members), $100 solid
+    single-clan, $150 cross-clan (majority in 3+ clans).
+  * Leader-signal mode: proven leads (first buyer on 2+ memes that drew 4+ buyers)
+    trigger a $50 starter on their first buy of a fresh token; clan-majority
+    confirmation tops it up to $100; unconfirmed starters time-stop at 72h.
+  * Leaderboard store fix: full payload (~195KB) exceeded the entity field limit
+    and was silently dropped every hour — now slimmed to top-25 essentials.
+
 Exit codes: 0 = ok (or expected bot-block), 1 = failure (visible in Actions).
 """
 import argparse
@@ -70,6 +84,20 @@ SKIP_NAME_MARKERS = ('robinhood token', 'backed',)
 PAPER_FEE_PCT = float(os.environ.get('FOMO_PAPER_FEE', '1.0'))   # 1% per side (fee + slippage)
 WATCH_HANDLE = os.environ.get('FOMO_WATCH_HANDLE', 'rasmr').lower()
 LEADER_MIN_INTERVAL = 55 * 60  # leaderboard fetch at most hourly (with natural cron jitter)
+
+# ---- v4 sim tuning (owner-approved 2026-09-20) ----
+PAPER_CONFIRM_CYCLES = int(os.environ.get('FOMO_PAPER_CONFIRM', '2'))        # majority stability before entry
+PAPER_EXIT_CONFIRM_CYCLES = int(os.environ.get('FOMO_PAPER_EXIT_CONFIRM', '2'))  # out-of-majority cycles before exit
+SIZING_MARGINAL_USD = float(os.environ.get('FOMO_SIZE_MARGINAL', '75'))      # holders share < 60% of clan
+SIZING_STANDARD_USD = PAPER_TRADE_USD                                        # solid single-clan majority
+SIZING_CROSSCLAN_USD = float(os.environ.get('FOMO_SIZE_CROSSCLAN', '150'))   # majority in 3+ clans
+CROSSCLAN_MIN_CLANS = int(os.environ.get('FOMO_CROSSCLAN_MIN', '3'))
+MARGINAL_MAX_SHARE = float(os.environ.get('FOMO_MARGINAL_MAX_SHARE', '0.60'))
+LEADER_STARTER_USD = float(os.environ.get('FOMO_LEADER_STARTER', '50'))      # proven-lead first-buy starter
+LEADER_CONFIRM_ADD_USD = float(os.environ.get('FOMO_LEADER_CONFIRM_ADD', '50'))  # top-up on majority confirm
+LEADER_TIMEOUT_H = float(os.environ.get('FOMO_LEADER_TIMEOUT', '72'))        # unconfirmed starter time-stop
+LEADER_CREDIT_BUYERS = int(os.environ.get('FOMO_LEADER_CREDIT_BUYERS', '4'))
+LEADER_PROVEN_HITS = int(os.environ.get('FOMO_LEADER_PROVEN_HITS', '2'))
 
 KEY = os.environ.get('FOMO_PIPELINE_KEY', fp.PIPELINE_KEY)
 if not KEY:
@@ -263,6 +291,60 @@ def _bullish_gate(info, flow48, flow24, holders, prev_holders):
     return True, ''
 
 
+def _parse_ts(iso):
+    try:
+        return datetime.fromisoformat((iso or '').replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+
+def _entry_size(h, members, cross_clan, addr):
+    """Conviction-weighted sizing (v4): cross-clan > solid single-clan > marginal."""
+    n_clans = len(cross_clan.get(addr, ()))
+    if n_clans >= CROSSCLAN_MIN_CLANS:
+        return SIZING_CROSSCLAN_USD, f'crossclan {n_clans}clans'
+    share = ((h.get('memberCount') or 0) / members) if members else 1.0
+    if share < MARGINAL_MAX_SHARE:
+        return SIZING_MARGINAL_USD, f'marginal {share:.0%}'
+    return SIZING_STANDARD_USD, 'standard'
+
+
+def _lead_update(all_events, st):
+    """Track per-token buyer sets from new events; credit the earliest buyer when a
+    token draws LEADER_CREDIT_BUYERS distinct buyers; promote users with
+    LEADER_PROVEN_HITS credits to proven leads. Returns first-buy events from
+    proven leads on tokens we haven't seen them buy before (entry signals).
+    Built entirely from events already fetched — zero extra fomo requests."""
+    signals = []
+    now_ts = time.time()
+    for ev in all_events or []:
+        if ev.get('type') not in ('large_buy', 'multi_user_buy'):
+            continue
+        user = ev.get('userHandle') or ''
+        if not user:
+            continue
+        k = _flow_key(ev.get('clanId', ''), ev.get('tokenAddress', ''))
+        bmap = st['buyers'].setdefault(k, {})
+        if user not in bmap:
+            ts = _parse_ts(ev.get('createdAt')) or now_ts
+            if ev.get('isFirstBuy') and user in st.get('proven', []):
+                signals.append(ev)
+            bmap[user] = ts
+    for k, bmap in st['buyers'].items():
+        if len(bmap) >= LEADER_CREDIT_BUYERS and not st['credited'].get(k):
+            first = min(bmap, key=lambda u: bmap[u])
+            st['leads'][first] = st['leads'].get(first, 0) + 1
+            if st['leads'][first] >= LEADER_PROVEN_HITS and first not in st['proven']:
+                st['proven'].append(first)
+                log(f"LEAD PROVEN: {first} — first buyer on {LEADER_PROVEN_HITS}+ crowd memes")
+            st['credited'][k] = True
+    for k in list(st['buyers'].keys()):
+        bmap = st['buyers'][k]
+        if bmap and max(bmap.values()) < now_ts - 7 * 86400:
+            del st['buyers'][k]
+    return signals
+
+
 def _paper_close(port, pos, exit_idx, reason, now, actions):
     pnl_pct = _pnl_pct(exit_idx, pos['entryPriceIdx'])
     pnl_usd = pos['sizeUsd'] * (pnl_pct / 100.0)
@@ -302,6 +384,24 @@ def run_paper_cycle(raw_clans, s, all_events):
     flow = load_state('meme_flow.json', {})
     _flow_update(all_events, flow)
 
+    # cross-clan majority map (v4 conviction sizing): token -> set of clan ids
+    cross_clan = {}
+    for clan in raw_clans:
+        cm = (clan.get('info') or {}).get('memberCount', 0) or 0
+        if cm < 2:
+            continue
+        for h in clan.get('holdings', []):
+            if (h.get('memberCount') or 0) > cm / 2.0:
+                a = h.get('tokenAddress')
+                if a:
+                    cross_clan.setdefault(a, set()).add(clan.get('id') or clan['name'])
+
+    # leader-signal state (v4)
+    st = load_state('lead_stats.json', None)
+    if st is None:
+        st = {'buyers': {}, 'credited': {}, 'leads': {}, 'proven': []}
+    lead_signals = _lead_update(all_events, st)
+
     actions = []
     exited_this_cycle = set()
     now = _now_iso()
@@ -328,18 +428,23 @@ def run_paper_cycle(raw_clans, s, all_events):
         clog = mlog['clans'].setdefault(clan_id, {'legacyDone': False, 'tokens': {}})
         toks = clog['tokens']
         for a, ent in toks.items():
-            if a not in majority and ent.get('droppedAt') is None:
-                ent['droppedAt'] = now
+            if a not in majority:
+                ent['outStreak'] = ent.get('outStreak', 0) + 1
+                ent['streak'] = 0
+                if ent.get('droppedAt') is None:
+                    ent['droppedAt'] = now
         for a in majority:
             ent = toks.get(a)
             if ent is None:
                 toks[a] = {'symbol': meta[a].get('symbol', ''), 'holders': meta[a].get('memberCount') or 0,
                            'prevHolders': None, 'firstAt': now, 'droppedAt': None,
-                           'wasLegacy': False, 'reCrossed': False}
+                           'wasLegacy': False, 'reCrossed': False, 'streak': 1, 'outStreak': 0}
                 log(f"MAJORITY LOG {name}: fresh majority {meta[a].get('symbol')}")
             else:
                 ent['prevHolders'] = ent.get('holders')
                 ent['holders'] = meta[a].get('memberCount') or 0
+                ent['streak'] = ent.get('streak', 0) + 1
+                ent['outStreak'] = 0
                 if ent.get('droppedAt'):
                     ent['droppedAt'] = None
                     if ent.get('sellExitAt'):
@@ -369,24 +474,40 @@ def run_paper_cycle(raw_clans, s, all_events):
                     exited_this_cycle.add((name, addr))
                     _paper_close(port, pos, idx, 'stop_-50', now, actions)
                 else:
-                    # majority-sell exit: visible distribution while below target
-                    h = meta.get(addr) or {}
-                    holders = h.get('memberCount') or 0
-                    flow6 = _flow_since(flow, clan_id, addr, 6)
-                    sellers = {f['user'] for f in flow6 if f['side'] == 'sell' and f['user']}
-                    sell_usd = sum(f['usd'] for f in flow6 if f['side'] == 'sell')
-                    hval = h.get('value') or 0
-                    need = max(2, int(0.3 * holders + 0.999)) if holders else 2
-                    if len(sellers) >= need or (hval > 0 and sell_usd >= 0.2 * hval):
-                        exited_this_cycle.add((name, addr))
-                        toks.setdefault(addr, {}).update(
-                            {'symbol': pos['symbol'], 'sellExitAt': time.time()})
-                        _paper_close(port, pos, idx, 'majority_sell_exit', now, actions)
-                        log(f"  majority-sell signal: {len(sellers)} seller(s) "
-                            f"({', '.join(sorted(sellers))}) in 6h, need {need}")
-                    elif addr not in majority:
-                        exited_this_cycle.add((name, addr))
-                        _paper_close(port, pos, idx, 'majority_exit', now, actions)
+                    closed_here = False
+                    # v4: unconfirmed lead starter time-stop
+                    if pos.get('mode') == 'lead' and not pos.get('confirmed'):
+                        opened_ts = _parse_ts(pos['openedAt']) or 0
+                        if opened_ts and (time.time() - opened_ts) / 3600.0 >= LEADER_TIMEOUT_H:
+                            exited_this_cycle.add((name, addr))
+                            _paper_close(port, pos, idx, 'lead_timeout', now, actions)
+                            log(f"  lead-timeout: {pos['symbol']} never reached clan majority")
+                            closed_here = True
+                    if not closed_here:
+                        # majority-sell exit: visible distribution while below target
+                        h = meta.get(addr) or {}
+                        holders = h.get('memberCount') or 0
+                        flow6 = _flow_since(flow, clan_id, addr, 6)
+                        sellers = {f['user'] for f in flow6 if f['side'] == 'sell' and f['user']}
+                        sell_usd = sum(f['usd'] for f in flow6 if f['side'] == 'sell')
+                        hval = h.get('value') or 0
+                        need = max(2, int(0.3 * holders + 0.999)) if holders else 2
+                        if len(sellers) >= need or (hval > 0 and sell_usd >= 0.2 * hval):
+                            exited_this_cycle.add((name, addr))
+                            toks.setdefault(addr, {}).update(
+                                {'symbol': pos['symbol'], 'sellExitAt': time.time()})
+                            _paper_close(port, pos, idx, 'majority_sell_exit', now, actions)
+                            log(f"  majority-sell signal: {len(sellers)} seller(s) "
+                                f"({', '.join(sorted(sellers))}) in 6h, need {need}")
+                        elif addr not in majority:
+                            if pos.get('mode') == 'lead' and not pos.get('confirmed'):
+                                pass  # unconfirmed lead starter: majority status is not its exit signal
+                            elif (toks.get(addr) or {}).get('outStreak', 0) >= PAPER_EXIT_CONFIRM_CYCLES:
+                                exited_this_cycle.add((name, addr))
+                                _paper_close(port, pos, idx, 'majority_exit', now, actions)
+                                log(f"  majority_exit confirmed: out of majority "
+                                    f"{(toks.get(addr) or {}).get('outStreak', 0)} cycles")
+                            # else: majority loss not yet confirmed — hold (anti-churn)
             else:
                 last = pos.get('lastIdx') or pos['entryPriceIdx']
                 exited_this_cycle.add((name, addr))
@@ -401,9 +522,11 @@ def run_paper_cycle(raw_clans, s, all_events):
                 continue
             if (name, addr) in exited_this_cycle:
                 continue  # cooldown: no same-cycle re-entry after an exit
-            if port['wallets'].get(name, 0) < PAPER_TRADE_USD:
-                continue
             info = toks.get(addr)
+            if info is None or info.get('streak', 0) < PAPER_CONFIRM_CYCLES:
+                continue  # v4: majority must hold N consecutive cycles (anti-churn)
+            if port['wallets'].get(name, 0) < SIZING_MARGINAL_USD:
+                continue
             flow48 = _flow_since(flow, clan_id, addr, 48)
             flow24 = _flow_since(flow, clan_id, addr, 24)
             ok, why = _bullish_gate(info, flow48, flow24,
@@ -412,14 +535,78 @@ def run_paper_cycle(raw_clans, s, all_events):
             if not ok:
                 log(f"PAPER SKIP {name}: {h.get('symbol')} — {why}")
                 continue
-            port['wallets'][name] -= PAPER_TRADE_USD
+            size, size_why = _entry_size(h, members, cross_clan, addr)
+            if port['wallets'].get(name, 0) < size:
+                continue
+            port['wallets'][name] -= size
             pos = {'pid': f"{name}|{addr}|{now}", 'clan': name, 'symbol': h.get('symbol', ''),
                    'tokenAddress': addr, 'networkId': h.get('networkId', 0), 'openedAt': now,
-                   'entryPriceIdx': price[addr], 'sizeUsd': PAPER_TRADE_USD, 'lastIdx': price[addr]}
+                   'entryPriceIdx': price[addr], 'sizeUsd': size, 'lastIdx': price[addr]}
             port['positions'].append(pos)
             actions.append({'type': 'open', **pos})
-            log(f"PAPER BUY {name}: ${PAPER_TRADE_USD:.0f} {h.get('symbol')} "
+            log(f"PAPER BUY {name}: ${size:.0f} {h.get('symbol')} ({size_why}) "
                 f"@idx {price[addr]:.4e} wallet=${port['wallets'][name]:.2f}")
+
+        # ---- v4: lead-confirm top-ups (unconfirmed lead starter crossed into majority) ----
+        for pos in [p for p in port['positions'] if p['clan'] == name]:
+            if pos.get('mode') != 'lead' or pos.get('confirmed'):
+                continue
+            addr = pos['tokenAddress']
+            if addr not in majority or addr not in price or (name, addr) in exited_this_cycle:
+                continue
+            info = toks.get(addr)
+            if info is None or info.get('streak', 0) < PAPER_CONFIRM_CYCLES:
+                continue  # confirm the majority before adding
+            if port['wallets'].get(name, 0) < LEADER_CONFIRM_ADD_USD:
+                continue
+            flow48 = _flow_since(flow, clan_id, addr, 48)
+            flow24 = _flow_since(flow, clan_id, addr, 24)
+            ok, why = _bullish_gate(info, flow48, flow24,
+                                    (meta[addr].get('memberCount') or 0),
+                                    info.get('prevHolders'))
+            if not ok:
+                log(f"LEAD HOLD {name}: {pos['symbol']} — top-up blocked: {why}")
+                continue
+            add = LEADER_CONFIRM_ADD_USD
+            new_size = pos['sizeUsd'] + add
+            new_entry = (pos['sizeUsd'] * pos['entryPriceIdx'] + add * price[addr]) / new_size
+            pos['entryPriceIdx'] = new_entry
+            pos['sizeUsd'] = new_size
+            pos['confirmed'] = True
+            pos['confirmedAt'] = now
+            port['wallets'][name] -= add
+            actions.append({'type': 'add', 'pid': pos['pid'], 'clan': name,
+                            'symbol': pos['symbol'], 'tokenAddress': addr,
+                            'openedAt': pos['openedAt'], 'addUsd': add,
+                            'sizeUsd': round(new_size, 2), 'entryPriceIdx': new_entry})
+            log(f"LEAD CONFIRM {name}: {pos['symbol']} hit clan majority — added ${add:.0f} "
+                f"(now ${new_size:.0f} @avg idx {new_entry:.4e})")
+
+        # ---- v4: lead-signal entries (proven lead's first buy on a fresh token) ----
+        for ev in lead_signals:
+            if ev.get('clanId') != clan_id:
+                continue
+            addr = ev.get('tokenAddress')
+            sym = ev.get('symbol') or ''
+            if not addr or _is_nonmeme({'symbol': sym}):
+                continue
+            if addr in majority or addr not in price:
+                continue  # majority logic owns it / token not priced in holdings yet
+            if any(p['clan'] == name and p['tokenAddress'] == addr for p in port['positions']):
+                continue
+            if (name, addr) in exited_this_cycle:
+                continue
+            if port['wallets'].get(name, 0) < LEADER_STARTER_USD:
+                continue
+            port['wallets'][name] -= LEADER_STARTER_USD
+            pos = {'pid': f"{name}|{addr}|{now}", 'clan': name, 'symbol': sym,
+                   'tokenAddress': addr, 'networkId': ev.get('networkId', 0), 'openedAt': now,
+                   'entryPriceIdx': price[addr], 'sizeUsd': LEADER_STARTER_USD, 'lastIdx': price[addr],
+                   'mode': 'lead', 'confirmed': False, 'leadUser': ev.get('userHandle', '')}
+            port['positions'].append(pos)
+            actions.append({'type': 'open', **pos})
+            log(f"LEAD BUY {name}: ${LEADER_STARTER_USD:.0f} {sym} — first buy by proven lead "
+                f"@{ev.get('userHandle')} @idx {price[addr]:.4e} wallet=${port['wallets'][name]:.2f}")
 
         # ---- marks for remaining open positions (fee-adjusted) ----
         for pos in [p for p in port['positions'] if p['clan'] == name]:
@@ -440,6 +627,7 @@ def run_paper_cycle(raw_clans, s, all_events):
     save_state('paper_portfolio.json', port)
     save_state('majority_log.json', mlog)
     save_state('meme_flow.json', flow)
+    save_state('lead_stats.json', st)
     open_pos = len(port['positions'])
     open_pnl = sum(pos['sizeUsd'] * _pnl_pct(pos.get('lastIdx', pos['entryPriceIdx']),
                                              pos['entryPriceIdx']) / 100.0
@@ -490,6 +678,32 @@ def _find_watch_user(obj, handle):
     return None
 
 
+def _slim_leaderboard(d):
+    """v4: the full leaderboard payload (~195KB) exceeds the Base44 entity field
+    limit and was silently dropped every hour. Slim to the report essentials."""
+    ro = d.get('responseObject') if isinstance(d, dict) else d
+    entries = None
+    if isinstance(ro, dict):
+        for v in ro.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                entries = v
+                break
+    elif isinstance(ro, list):
+        entries = ro
+    out = []
+    for e in (entries or [])[:25]:
+        clan = e.get('clan') or {}
+        holds = []
+        for t in (e.get('topHoldings') or [])[:5]:
+            holds.append(t.get('ticker') or t.get('symbol') or t.get('name') or '')
+        out.append({'userHandle': e.get('userHandle'), 'displayName': e.get('displayName'),
+                    'totalPnL': e.get('totalPnL'), 'followers': e.get('followers'),
+                    'numTrades': e.get('numTrades'),
+                    'clan': clan.get('name') if isinstance(clan, dict) else clan,
+                    'topHoldings': [x for x in holds if x]})
+    return {'fetchedAt': _now_iso(), 'top': out}
+
+
 def fetch_leader_and_rasmr(s, token):
     """Hourly: probe leaderboard endpoints (auth'd, paced) and fetch the watchlist
     profile (@rasmr). All results + probe diagnostics go to LeaderData via the
@@ -528,10 +742,12 @@ def fetch_leader_and_rasmr(s, token):
     items = []
     if payload is not None:
         meta['lastOkUrl'] = ok_url
+        slim = _slim_leaderboard(payload)
         items.append({'key': 'leaderboard_all',
-                      'payload': json.dumps(payload)[:200000],
+                      'payload': json.dumps(slim),
                       'fetchedAt': now,
-                      'note': f"endpoint: {ok_url}; probe results: {json.dumps(probes)[:600]}"})
+                      'note': f"slim top-25 via {ok_url.split('?')[0]} "
+                              f"(raw {len(json.dumps(payload)) // 1024}KB exceeded entity field limit)"})
         wuser = _find_watch_user(payload, WATCH_HANDLE)
         wsrc = 'leaderboard entry'
     else:
