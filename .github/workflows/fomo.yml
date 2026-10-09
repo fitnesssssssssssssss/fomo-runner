@@ -1,8 +1,7 @@
 name: fomo-fetch
 on:
   schedule:
-    - cron: '*/15 * * * *'
-+ cron: '7-52/15 * * * *'
+    - cron: '7-52/15 * * * *'
   workflow_dispatch: {}
 permissions:
   contents: write
