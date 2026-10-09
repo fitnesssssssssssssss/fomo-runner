@@ -77,7 +77,7 @@ SEEN_CAP = fp.MAX_SEEN
 PAPER_WALLET_USD = float(os.environ.get('FOMO_PAPER_WALLET', '500'))
 PAPER_TRADE_USD = float(os.environ.get('FOMO_PAPER_TRADE', '100'))
 PAPER_TARGET_PCT = float(os.environ.get('FOMO_PAPER_TARGET', '100'))    # +100% = 2x sell
-PAPER_STOP_PCT = float(os.environ.get('FOMO_PAPER_STOP', '-50'))        # -50% stop loss
+PAPER_STOP_PCT = float(os.environ.get('FOMO_PAPER_STOP', '-30'))        # -50% stop loss
 SKIP_SYMBOLS = {'WETH', 'SOL', 'WSOL', 'USDC', 'USDT', 'DAI', 'PYUSD', 'WBTC', 'WSTETH',
                 'CBBTC', 'USDE', 'USDS', 'WSTETH', 'STETH', 'RETH', 'CBETH'}
 SKIP_NAME_MARKERS = ('robinhood token', 'backed',)
@@ -98,6 +98,15 @@ LEADER_CONFIRM_ADD_USD = float(os.environ.get('FOMO_LEADER_CONFIRM_ADD', '50')) 
 LEADER_TIMEOUT_H = float(os.environ.get('FOMO_LEADER_TIMEOUT', '72'))        # unconfirmed starter time-stop
 LEADER_CREDIT_BUYERS = int(os.environ.get('FOMO_LEADER_CREDIT_BUYERS', '4'))
 LEADER_PROVEN_HITS = int(os.environ.get('FOMO_LEADER_PROVEN_HITS', '2'))
+
+# ---------- v5 sim upgrades (2026-10-09) ----------
+V5_TREND_MAX_DROP = float(os.environ.get('FOMO_TREND_MAX_DROP', '5'))    # skip if price >5% below 24-48h-ago level
+V5_TP_PCT = float(os.environ.get('FOMO_TP_PCT', '25'))                   # partial take-profit trigger
+V5_TRAIL_DROP = float(os.environ.get('FOMO_TRAIL_DROP', '20'))           # trail exit: drawdown from high-water mark
+V5_TIME_STOP_H = float(os.environ.get('FOMO_TIME_STOP_H', '72'))         # flat-position time stop
+V5_TIME_STOP_MIN_PCT = float(os.environ.get('FOMO_TIME_STOP_MIN', '20')) # 'no gain' threshold for time stop
+V5_BREAKER_LOSSES = int(os.environ.get('FOMO_BREAKER_LOSSES', '2'))      # straight losing closes -> breaker
+V5_BREAKER_DAYS = float(os.environ.get('FOMO_BREAKER_DAYS', '7'))        # breaker blacklist duration
 
 KEY = os.environ.get('FOMO_PIPELINE_KEY', fp.PIPELINE_KEY)
 if not KEY:
@@ -291,6 +300,40 @@ def _bullish_gate(info, flow48, flow24, holders, prev_holders):
     return True, ''
 
 
+
+def _trend_ok(phist, addr, now_idx):
+    """v5 trend gate: refuse entries when the token's price index sits more than
+    V5_TREND_MAX_DROP below its level 20-48h ago (falling knife filter).
+    No history yet -> pass (cannot judge)."""
+    now_ts = time.time()
+    pts = [p for p in (phist.get(addr) or []) if 20 * 3600 <= now_ts - p[0] <= 48 * 3600]
+    if not pts:
+        return True, ''
+    ref = min(pts, key=lambda p: p[0])[1]   # oldest point in the window
+    if now_idx < ref * (1 - V5_TREND_MAX_DROP / 100.0):
+        return False, f'falling {100 * (1 - now_idx / ref):.0f}% vs 20-48h level'
+    return True, ''
+
+
+_BRK = {}   # per-cycle circuit-breaker state; _paper_close records losses into it
+
+
+def _breaker_blocked(brk, addr):
+    b = brk.get(addr)
+    return bool(b and time.time() < (b.get('until') or 0))
+
+
+def _breaker_record(brk, addr, pnl_pct):
+    """v5 per-meme circuit breaker: 2 straight losing closes -> 7-day blacklist."""
+    b = brk.setdefault(addr, {'consec': 0, 'until': 0})
+    b['consec'] = (b.get('consec', 0) + 1) if pnl_pct < 0 else 0
+    if b.get('consec', 0) >= V5_BREAKER_LOSSES:
+        b['until'] = time.time() + V5_BREAKER_DAYS * 86400
+        b['consec'] = 0
+        log(f"MEME BREAKER: {addr[:10]} blacklisted {V5_BREAKER_DAYS:.0f}d "
+            f"after {V5_BREAKER_LOSSES} straight losing closes")
+
+
 def _parse_ts(iso):
     try:
         return datetime.fromisoformat((iso or '').replace('Z', '+00:00')).timestamp()
@@ -298,12 +341,22 @@ def _parse_ts(iso):
         return None
 
 
-def _entry_size(h, members, cross_clan, addr):
+def _entry_size(h, members, cross_clan, addr, st=None):
     """Conviction-weighted sizing (v4): cross-clan > solid single-clan > marginal."""
     n_clans = len(cross_clan.get(addr, ()))
     if n_clans >= CROSSCLAN_MIN_CLANS:
         return SIZING_CROSSCLAN_USD, f'crossclan {n_clans}clans'
     share = ((h.get('memberCount') or 0) / members) if members else 1.0
+    lead = False
+    if st:
+        for cid, bmap in (st.get('buyers') or {}).items():
+            if cid.split('|', 1)[-1] == addr and any(u in st.get('proven', []) for u in bmap):
+                lead = True
+                break
+    if lead:
+        if share is not None and share < MARGINAL_MAX_SHARE:
+            return SIZING_STANDARD_USD, 'lead-boost (marginal -> standard)'
+        return SIZING_CROSSCLAN_USD, 'lead-boost (proven lead aboard)'
     if share < MARGINAL_MAX_SHARE:
         return SIZING_MARGINAL_USD, f'marginal {share:.0%}'
     return SIZING_STANDARD_USD, 'standard'
@@ -348,6 +401,8 @@ def _lead_update(all_events, st):
 def _paper_close(port, pos, exit_idx, reason, now, actions):
     pnl_pct = _pnl_pct(exit_idx, pos['entryPriceIdx'])
     pnl_usd = pos['sizeUsd'] * (pnl_pct / 100.0)
+    if _BRK is not None:
+        _breaker_record(_BRK, pos['tokenAddress'], pnl_pct)
     port['wallets'][pos['clan']] = port['wallets'].get(pos['clan'], 0) + pos['sizeUsd'] + pnl_usd
     port['positions'].remove(pos)
     closed = dict(pos)
@@ -365,7 +420,7 @@ def _paper_close(port, pos, exit_idx, reason, now, actions):
 
 
 def run_paper_cycle(raw_clans, s, all_events):
-    """Simulate the majority-follow strategy on this cycle's fresh data (v3).
+    """Simulate the majority-follow strategy on this cycle's fresh data (v5: trend gate, per-meme breaker, partial TP + trail, -30 stop, 72h time stop, lead-boost sizing).
 
     raw_clans: list of raw clan dicts ({'id','name','info','holdings'}) for fetches
     that succeeded. all_events: this cycle's NEW trade events (builds the 48h flow
@@ -382,6 +437,10 @@ def run_paper_cycle(raw_clans, s, all_events):
     if mlog is None:
         mlog = {'clans': {}}
     flow = load_state('meme_flow.json', {})
+    phist = load_state('price_hist.json', {})
+    brk = load_state('meme_breakers.json', {})
+    global _BRK
+    _BRK = brk
     _flow_update(all_events, flow)
 
     # cross-clan majority map (v4 conviction sizing): token -> set of clan ids
@@ -395,6 +454,19 @@ def run_paper_cycle(raw_clans, s, all_events):
                 a = h.get('tokenAddress')
                 if a:
                     cross_clan.setdefault(a, set()).add(clan.get('id') or clan['name'])
+
+    # v5: price history for the trend gate (24-48h of per-token price idx)
+    _now_ts = time.time()
+    for clan in raw_clans:
+        for h in clan.get('holdings', []):
+            a = h.get('tokenAddress')
+            idx = _price_idx(h)
+            if a and idx is not None:
+                phist.setdefault(a, []).append([_now_ts, idx])
+    for a in list(phist.keys()):
+        phist[a] = [p for p in phist[a] if _now_ts - p[0] <= 48 * 3600][-400:]
+        if not phist[a]:
+            del phist[a]
 
     # leader-signal state (v4)
     st = load_state('lead_stats.json', None)
@@ -467,14 +539,46 @@ def run_paper_cycle(raw_clans, s, all_events):
             if idx is not None:
                 pos['lastIdx'] = idx
                 pnl_pct = _pnl_pct(idx, pos['entryPriceIdx'])
+                pos['highPct'] = max(pos.get('highPct', 0.0), pnl_pct)
                 if pnl_pct >= PAPER_TARGET_PCT:
                     exited_this_cycle.add((name, addr))
                     _paper_close(port, pos, idx, 'target_2x', now, actions)
                 elif pnl_pct <= PAPER_STOP_PCT:
                     exited_this_cycle.add((name, addr))
-                    _paper_close(port, pos, idx, 'stop_-50', now, actions)
+                    _paper_close(port, pos, idx, f'stop_{int(PAPER_STOP_PCT)}', now, actions)
                 else:
                     closed_here = False
+                    # ---- v5: trail exit after partial ----
+                    if pos.get('tookPartial') and pnl_pct <= pos['highPct'] - V5_TRAIL_DROP:
+                        exited_this_cycle.add((name, addr))
+                        _paper_close(port, pos, idx, 'trail_exit', now, actions)
+                        log(f"  trail_exit: {pos['symbol']} fell to {pnl_pct:+.1f}% from high "
+                            f"{pos['highPct']:+.1f}%")
+                        closed_here = True
+                    # ---- v5: partial take-profit at +25% (bank half, trail rest) ----
+                    if not closed_here and not pos.get('tookPartial') and pnl_pct >= V5_TP_PCT:
+                        half = pos['sizeUsd'] / 2.0
+                        pnl_half = half * pnl_pct / 100.0
+                        pos['sizeUsd'] = pos['sizeUsd'] - half
+                        pos['tookPartial'] = True
+                        port['wallets'][name] = port['wallets'].get(name, 0) + half + pnl_half
+                        actions.append({'type': 'add', 'pid': pos['pid'], 'clan': name,
+                                        'symbol': pos['symbol'], 'tokenAddress': addr,
+                                        'openedAt': pos['openedAt'], 'addUsd': -half,
+                                        'sizeUsd': round(pos['sizeUsd'], 2),
+                                        'entryPriceIdx': pos['entryPriceIdx']})
+                        log(f"  partial_tp: banked ${half:.0f} of {pos['symbol']} at "
+                            f"{pnl_pct:+.1f}% — trailing the rest")
+                    # ---- v5: time stop on flat positions ----
+                    if not closed_here:
+                        opened_ts = _parse_ts(pos['openedAt']) or 0
+                        if opened_ts and (time.time() - opened_ts) / 3600.0 >= V5_TIME_STOP_H \
+                                and pnl_pct < V5_TIME_STOP_MIN_PCT:
+                            exited_this_cycle.add((name, addr))
+                            _paper_close(port, pos, idx, 'time_stop', now, actions)
+                            log(f"  time_stop: {pos['symbol']} flat {pnl_pct:+.1f}% after "
+                                f"{V5_TIME_STOP_H:.0f}h")
+                            closed_here = True
                     # v4: unconfirmed lead starter time-stop
                     if pos.get('mode') == 'lead' and not pos.get('confirmed'):
                         opened_ts = _parse_ts(pos['openedAt']) or 0
@@ -535,7 +639,14 @@ def run_paper_cycle(raw_clans, s, all_events):
             if not ok:
                 log(f"PAPER SKIP {name}: {h.get('symbol')} — {why}")
                 continue
-            size, size_why = _entry_size(h, members, cross_clan, addr)
+            if _breaker_blocked(brk, addr):
+                log(f"PAPER SKIP {name}: {h.get('symbol')} — circuit breaker active")
+                continue
+            tok_ok, tok_why = _trend_ok(phist, addr, price[addr])
+            if not tok_ok:
+                log(f"PAPER SKIP {name}: {h.get('symbol')} — {tok_why}")
+                continue
+            size, size_why = _entry_size(h, members, cross_clan, addr, st)
             if port['wallets'].get(name, 0) < size:
                 continue
             port['wallets'][name] -= size
@@ -590,6 +701,12 @@ def run_paper_cycle(raw_clans, s, all_events):
             sym = ev.get('symbol') or ''
             if not addr or _is_nonmeme({'symbol': sym}):
                 continue
+            if _breaker_blocked(brk, addr):
+                continue
+            lead_tok_ok, _ = _trend_ok(phist, addr, price.get(addr) or 0)
+            if not lead_tok_ok:
+                log(f"LEAD SKIP {name}: {sym} — breaker/trend gate")
+                continue
             if addr in majority or addr not in price:
                 continue  # majority logic owns it / token not priced in holdings yet
             if any(p['clan'] == name and p['tokenAddress'] == addr for p in port['positions']):
@@ -627,6 +744,8 @@ def run_paper_cycle(raw_clans, s, all_events):
     save_state('paper_portfolio.json', port)
     save_state('majority_log.json', mlog)
     save_state('meme_flow.json', flow)
+    save_state('price_hist.json', phist)
+    save_state('meme_breakers.json', brk)
     save_state('lead_stats.json', st)
     open_pos = len(port['positions'])
     open_pnl = sum(pos['sizeUsd'] * _pnl_pct(pos.get('lastIdx', pos['entryPriceIdx']),
