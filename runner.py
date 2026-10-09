@@ -183,15 +183,19 @@ def get_valid_token(s):
     if left < 300:  # under 5 min -> refresh (rotates both tokens)
         log(f"Token has {left:.0f}s left — refreshing via Privy")
         try:
-            r = s.post('https://auth.privy.io/api/v1/sessions',
-                       json={"refresh_token": blob.get('refresh_token')},
+            r = s.post('https://privy.fomo.family/api/v1/sessions',
+                       json={},
                        headers={
                            'Authorization': f"Bearer {blob['token']}",
                            'Content-Type': 'application/json',
                            'Origin': 'https://fomo.family',
+                           'Referer': 'https://fomo.family/',
                            'privy-app-id': fp.PRIVY_APP_ID,
                            'privy-client-id': fp.PRIVY_CLIENT_ID,
-                           'privy-client': 'react-auth:3.34.0',
+                           'privy-client': 'react-auth:3.48.0',
+                           # SDK 3.48.0: refresh credential rides in an httpOnly
+                           # cookie on .privy.fomo.family — no body token anymore.
+                           'Cookie': f"privy-refresh-token={blob.get('refresh_token')}",
                        }, impersonate='chrome', timeout=30)
             if r.status_code in fp.BLOCK_STATUSES:
                 raise fp.BotBlock(f"refresh HTTP {r.status_code}")
@@ -201,7 +205,8 @@ def get_valid_token(s):
                 if new_tok:
                     blob['token'] = new_tok
                     nr = d.get('refresh_token')
-                    if nr:
+                    # SDK 3.48 returns 'deprecated' here; keep the cookie value otherwise.
+                    if nr and nr != 'deprecated':
                         blob['refresh_token'] = nr
                     save_auth(s, blob)
                     log("Token refreshed OK")
