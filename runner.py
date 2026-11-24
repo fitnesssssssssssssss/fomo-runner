@@ -55,6 +55,7 @@ Exit codes: 0 = ok (or expected bot-block), 1 = failure (visible in Actions).
 import argparse
 import json
 import os
+import re
 import random
 import sys
 import time
@@ -204,12 +205,32 @@ def get_valid_token(s):
                 new_tok = d.get('token') or d.get('privy_access_token')
                 if new_tok:
                     blob['token'] = new_tok
+                    # 2026-11-24 FIX: Privy ROTATES the refresh credential as a
+                    # Set-Cookie on .privy.fomo.family; the JSON body returns
+                    # 'deprecated'. The old code kept the previous refresh token, so
+                    # the next refresh 401'd and the whole chain died ~4h after any
+                    # rotation (this caused the Nov 22-24 outage). Capture the rotated
+                    # cookie from the response headers, then from the session jar.
+                    rotated = None
+                    try:
+                        raw = r.headers.get('set-cookie') or ''
+                        m = re.search(r'privy-refresh-token=([^;\s]+)', raw)
+                        if m:
+                            rotated = m.group(1)
+                    except Exception:
+                        pass
+                    if not rotated:
+                        try:
+                            rotated = s.cookies.get('privy-refresh-token')
+                        except Exception:
+                            pass
                     nr = d.get('refresh_token')
-                    # SDK 3.48 returns 'deprecated' here; keep the cookie value otherwise.
-                    if nr and nr != 'deprecated':
+                    if rotated:
+                        blob['refresh_token'] = rotated
+                    elif nr and nr != 'deprecated':
                         blob['refresh_token'] = nr
                     save_auth(s, blob)
-                    log("Token refreshed OK")
+                    log("Token refreshed OK (refresh cookie " + ("rotated+stored" if rotated else "unchanged") + ")")
                     return blob['token']
             if left <= 0:
                 raise RuntimeError(f"token expired and refresh failed (HTTP {r.status_code})")
