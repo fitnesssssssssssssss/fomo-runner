@@ -55,7 +55,6 @@ Exit codes: 0 = ok (or expected bot-block), 1 = failure (visible in Actions).
 import argparse
 import json
 import os
-import re
 import random
 import sys
 import time
@@ -87,11 +86,12 @@ WATCH_HANDLE = os.environ.get('FOMO_WATCH_HANDLE', 'rasmr').lower()
 LEADER_MIN_INTERVAL = 55 * 60  # leaderboard fetch at most hourly (with natural cron jitter)
 
 # ---- v4 sim tuning (owner-approved 2026-09-20) ----
+REENTRY_COOLDOWN_D = float(os.environ.get('FOMO_REENTRY_COOLDOWN_D', '7'))   # v6: no re-entry into a token this clan just lost on
 PAPER_CONFIRM_CYCLES = int(os.environ.get('FOMO_PAPER_CONFIRM', '2'))        # majority stability before entry
 PAPER_EXIT_CONFIRM_CYCLES = int(os.environ.get('FOMO_PAPER_EXIT_CONFIRM', '2'))  # out-of-majority cycles before exit
-SIZING_MARGINAL_USD = float(os.environ.get('FOMO_SIZE_MARGINAL', '75'))      # holders share < 60% of clan
+SIZING_MARGINAL_USD = float(os.environ.get('FOMO_SIZE_MARGINAL', '25'))      # v6: $75 tier measured 3/30 wins, -$386
 SIZING_STANDARD_USD = PAPER_TRADE_USD                                        # solid single-clan majority
-SIZING_CROSSCLAN_USD = float(os.environ.get('FOMO_SIZE_CROSSCLAN', '150'))   # majority in 3+ clans
+SIZING_CROSSCLAN_USD = float(os.environ.get('FOMO_SIZE_CROSSCLAN', '50'))    # v6: $150 tier measured 2/32 wins, -$450
 CROSSCLAN_MIN_CLANS = int(os.environ.get('FOMO_CROSSCLAN_MIN', '3'))
 MARGINAL_MAX_SHARE = float(os.environ.get('FOMO_MARGINAL_MAX_SHARE', '0.60'))
 LEADER_STARTER_USD = float(os.environ.get('FOMO_LEADER_STARTER', '50'))      # proven-lead first-buy starter
@@ -104,8 +104,8 @@ LEADER_PROVEN_HITS = int(os.environ.get('FOMO_LEADER_PROVEN_HITS', '2'))
 V5_TREND_MAX_DROP = float(os.environ.get('FOMO_TREND_MAX_DROP', '5'))    # skip if price >5% below 24-48h-ago level
 V5_TP_PCT = float(os.environ.get('FOMO_TP_PCT', '25'))                   # partial take-profit trigger
 V5_TRAIL_DROP = float(os.environ.get('FOMO_TRAIL_DROP', '20'))           # trail exit: drawdown from high-water mark
-V5_TIME_STOP_H = float(os.environ.get('FOMO_TIME_STOP_H', '72'))         # flat-position time stop
-V5_TIME_STOP_MIN_PCT = float(os.environ.get('FOMO_TIME_STOP_MIN', '20')) # 'no gain' threshold for time stop
+V5_TIME_STOP_H = float(os.environ.get('FOMO_TIME_STOP_H', '24'))         # flat-position time stop
+V5_TIME_STOP_MIN_PCT = float(os.environ.get('FOMO_TIME_STOP_MIN', '10')) # 'no gain' threshold for time stop
 V5_BREAKER_LOSSES = int(os.environ.get('FOMO_BREAKER_LOSSES', '2'))      # straight losing closes -> breaker
 V5_BREAKER_DAYS = float(os.environ.get('FOMO_BREAKER_DAYS', '7'))        # breaker blacklist duration
 
@@ -205,32 +205,12 @@ def get_valid_token(s):
                 new_tok = d.get('token') or d.get('privy_access_token')
                 if new_tok:
                     blob['token'] = new_tok
-                    # 2026-11-24 FIX: Privy ROTATES the refresh credential as a
-                    # Set-Cookie on .privy.fomo.family; the JSON body returns
-                    # 'deprecated'. The old code kept the previous refresh token, so
-                    # the next refresh 401'd and the whole chain died ~4h after any
-                    # rotation (this caused the Nov 22-24 outage). Capture the rotated
-                    # cookie from the response headers, then from the session jar.
-                    rotated = None
-                    try:
-                        raw = r.headers.get('set-cookie') or ''
-                        m = re.search(r'privy-refresh-token=([^;\s]+)', raw)
-                        if m:
-                            rotated = m.group(1)
-                    except Exception:
-                        pass
-                    if not rotated:
-                        try:
-                            rotated = s.cookies.get('privy-refresh-token')
-                        except Exception:
-                            pass
                     nr = d.get('refresh_token')
-                    if rotated:
-                        blob['refresh_token'] = rotated
-                    elif nr and nr != 'deprecated':
+                    # SDK 3.48 returns 'deprecated' here; keep the cookie value otherwise.
+                    if nr and nr != 'deprecated':
                         blob['refresh_token'] = nr
                     save_auth(s, blob)
-                    log("Token refreshed OK (refresh cookie " + ("rotated+stored" if rotated else "unchanged") + ")")
+                    log("Token refreshed OK")
                     return blob['token']
             if left <= 0:
                 raise RuntimeError(f"token expired and refresh failed (HTTP {r.status_code})")
@@ -652,6 +632,15 @@ def run_paper_cycle(raw_clans, s, all_events):
                 continue
             if (name, addr) in exited_this_cycle:
                 continue  # cooldown: no same-cycle re-entry after an exit
+            # v6: same-cycle cooldown was useless at 4-6h cadence. WORM was re-bought 32
+            # times across four clans for -$534 (66% of all losses), so block re-entry for N days.
+            _now_ts = _parse_ts(now)
+            _cool = REENTRY_COOLDOWN_D * 86400
+            if any(c.get('clan') == name and c.get('tokenAddress') == addr
+                   and c.get('closedAt') and 0 <= _now_ts - _parse_ts(c['closedAt']) < _cool
+                   for c in port.get('closed', [])):
+                log(f"PAPER SKIP {name}: {h.get('symbol')} — re-entry cooldown {REENTRY_COOLDOWN_D:.0f}d")
+                continue
             info = toks.get(addr)
             if info is None or info.get('streak', 0) < PAPER_CONFIRM_CYCLES:
                 continue  # v4: majority must hold N consecutive cycles (anti-churn)
