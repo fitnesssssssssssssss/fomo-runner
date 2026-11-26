@@ -104,13 +104,8 @@ def main():
     return 0
 
 
-if __name__ == '__main__':
-    _rc = main()
-    _run_pool_probe()
-    sys.exit(_rc)
-
-
 def _rotate(path):
+    """Keep the append-only logs from growing the repo without bound."""
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -122,8 +117,15 @@ def _rotate(path):
 
 
 def _run_pool_probe():
+    """Phase 2 capture rides this script so the runner and workflow stay untouched."""
     try:
         import new_pool_probe
         new_pool_probe.main()
     except Exception as e:
         print(f"depth: pool probe skipped: {e}", flush=True)
+
+
+if __name__ == '__main__':
+    _rc = main()
+    _run_pool_probe()
+    sys.exit(_rc)
