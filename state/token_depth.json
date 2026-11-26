@@ -1,14 +1,25 @@
 {
+ "0xD5f1afEA47b1A9eab414D2ee740cF1d6d039E725": {
+  "at": 1795681291,
+  "chain": "robinhood",
+  "createdAt": 1787831323000,
+  "dexId": "uniswap",
+  "impactBps100": 14.3,
+  "liqUsd": 140058.8,
+  "pairs": 1,
+  "priceUsd": "0.003853",
+  "vol24h": 35701.3
+ },
  "4MMQY9bwkxxTtsK3W227Q5ABT6yFY8Pmn9Ze7wmAXKY8": {
-  "at": 1795681209,
+  "at": 1795681291,
   "chain": "solana",
   "createdAt": 1789156938000,
   "dexId": "raydium",
   "holders": 8,
   "impactBps100": 21.2,
   "liqUsd": 94405.91,
-  "majorityShare": null,
-  "memberCount": 0,
+  "majorityShare": 0.533,
+  "memberCount": 15,
   "pairs": 1,
   "priceUsd": "0.0008727",
   "source": "majority",
@@ -16,19 +27,19 @@
   "vol24h": 11599.03
  },
  "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": {
-  "at": 1795681209,
+  "at": 1795681291,
   "chain": "solana",
   "createdAt": 1760844415000,
   "dexId": "orca",
   "holders": 8,
   "impactBps100": 0.9,
-  "liqUsd": 2116929.94,
-  "majorityShare": null,
-  "memberCount": 0,
+  "liqUsd": 2110597.47,
+  "majorityShare": 0.533,
+  "memberCount": 15,
   "pairs": 1,
-  "priceUsd": "745.36",
+  "priceUsd": "742.87",
   "source": "majority",
   "symbol": "ZEC",
-  "vol24h": 3577735.09
+  "vol24h": 3577679.96
  }
 }
