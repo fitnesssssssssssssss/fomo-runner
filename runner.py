@@ -57,6 +57,7 @@ import json
 import os
 import re
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -1085,6 +1086,11 @@ def main():
         try:
             token = get_token()
             ok = run_cycle(s, token, dry=args.dry_run)
+            # depth probe: records live pool depth for held/signalled tokens (free, no new workflow)
+            try:
+                subprocess.run([sys.executable, 'depth_probe.py'], timeout=120, check=False)
+            except Exception as _e:
+                log(f'depth probe skipped: {_e}')
             if not args.loop:
                 sys.exit(0 if ok else 1)
         except fp.BotBlock as b:
