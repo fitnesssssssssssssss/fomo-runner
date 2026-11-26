@@ -1,0 +1,20 @@
+{
+ "4MMQY9bwkxxTtsK3W227Q5ABT6yFY8Pmn9Ze7wmAXKY8": {
+  "at": 1795680045,
+  "createdAt": 1789156938000,
+  "impactBps100": 20.7,
+  "liqUsd": 96832.69,
+  "pairs": 1,
+  "priceUsd": "0.0009135",
+  "vol24h": 10604.82
+ },
+ "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": {
+  "at": 1795680045,
+  "createdAt": 1760844415000,
+  "impactBps100": 0.9,
+  "liqUsd": 2113080.68,
+  "pairs": 1,
+  "priceUsd": "744.044",
+  "vol24h": 3573338.28
+ }
+}
