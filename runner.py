@@ -1007,12 +1007,11 @@ def run_cycle(s, token, dry=False):
     try:
         _cm = {}
         for _r in (results or []):
-            _info = _r.get('info') or {}
             _key = _r.get('name') or _r.get('clanId')
             if not _key:
                 continue
-            _cm[_key] = {'clanId': _r.get('clanId'), 'memberCount': _info.get('memberCount') or 0,
-                         'holdingsValue': _info.get('holdingsValue') or 0,
+            _cm[_key] = {'clanId': _r.get('clanId'), 'memberCount': _r.get('memberCount') or 0,
+                         'rank': _r.get('rank') or 0, 'pnl': _r.get('pnl') or 0,
                          'at': datetime.now(timezone.utc).isoformat()}
         if _cm:
             save_state('clan_meta.json', _cm)
