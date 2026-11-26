@@ -185,11 +185,11 @@ def main():
 
 
 def _run_pool_probe():
-    try:
-        import new_pool_probe
-        new_pool_probe.main()
-    except Exception as e:
-        print(f"depth: pool probe skipped: {e}", flush=True)
+    for mod in ('candle_probe', 'new_pool_probe'):
+        try:
+            __import__(mod).main()
+        except Exception as e:
+            print(f"depth: {mod} skipped: {e}", flush=True)
 
 
 if __name__ == '__main__':
