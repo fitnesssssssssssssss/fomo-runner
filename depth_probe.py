@@ -105,7 +105,9 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    _rc = main()
+    _run_pool_probe()
+    sys.exit(_rc)
 
 
 def _rotate(path):
@@ -125,7 +127,3 @@ def _run_pool_probe():
         new_pool_probe.main()
     except Exception as e:
         print(f"depth: pool probe skipped: {e}", flush=True)
-
-
-if __name__ == '__main__':
-    _run_pool_probe()
