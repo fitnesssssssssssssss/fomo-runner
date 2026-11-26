@@ -1003,6 +1003,22 @@ def run_cycle(s, token, dry=False):
         log(f"Snapshot store error: {e}")
         all_ok = False
 
+    # ---- clan meta (memberCount per clan, so majority share can be computed honestly later) ----
+    try:
+        _cm = {}
+        for _r in (results or []):
+            _info = _r.get('info') or {}
+            _key = _r.get('name') or _r.get('clanId')
+            if not _key:
+                continue
+            _cm[_key] = {'clanId': _r.get('clanId'), 'memberCount': _info.get('memberCount') or 0,
+                         'holdingsValue': _info.get('holdingsValue') or 0,
+                         'at': datetime.now(timezone.utc).isoformat()}
+        if _cm:
+            save_state('clan_meta.json', _cm)
+    except Exception as e:
+        log(f"clan_meta save skipped: {e}")
+
     # ---- trade events (chunked) ----
     by_clan = {}
     for ev in all_events:
