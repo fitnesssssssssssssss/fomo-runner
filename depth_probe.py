@@ -91,6 +91,10 @@ def main():
     os.makedirs(STATE, exist_ok=True)
     with open(os.path.join(STATE, 'token_depth.json'), 'w') as f:
         json.dump(depth, f, indent=1, sort_keys=True)
+    # rolling history: one line per run so depth-at-signal-time can be joined to outcomes later
+    with open(os.path.join(STATE, 'depth_log.jsonl'), 'a') as f:
+        for addr, rec in depth.items():
+            f.write(json.dumps({'at': now, 'addr': addr, **rec}) + '\n')
     print(f'depth: probed {len(addrs)} tokens, got {len(depth)} with pools')
     thin = [a for a, r in depth.items() if (r.get('impactBps100') or 0) > 200]
     print(f'depth: {len(thin)} tokens would cost >2% per $100 clip')
