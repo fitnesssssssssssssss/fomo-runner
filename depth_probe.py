@@ -20,6 +20,7 @@ NOTIONAL = 100.0
 # instead of being silently dropped, so coverage gaps stay visible.
 CHAIN_BY_NETWORK = {
     1399811149: 'solana',
+    4663: 'robinhood',   # verified against DexScreener 2026-11-26: 1 pair returned
 }
 
 
