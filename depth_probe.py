@@ -15,6 +15,8 @@ import time
 import urllib.request
 
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state')
+MAX_LOG_LINES = 20000
+CHAIN_IDS = {1399811149: 'solana'}   # DexScreener slugs; unknown chains are logged, never guessed
 SOLANA = {1399811149, '1399811149', 'solana'}
 BATCH = 30
 
@@ -95,6 +97,7 @@ def main():
     with open(os.path.join(STATE, 'depth_log.jsonl'), 'a') as f:
         for addr, rec in depth.items():
             f.write(json.dumps({'at': now, 'addr': addr, **rec}) + '\n')
+    _rotate(os.path.join(STATE, 'depth_log.jsonl'))
     print(f'depth: probed {len(addrs)} tokens, got {len(depth)} with pools')
     thin = [a for a, r in depth.items() if (r.get('impactBps100') or 0) > 200]
     print(f'depth: {len(thin)} tokens would cost >2% per $100 clip')
@@ -103,3 +106,26 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def _rotate(path):
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        if len(lines) > MAX_LOG_LINES:
+            with open(path, 'w') as f:
+                f.writelines(lines[-MAX_LOG_LINES:])
+    except Exception as e:
+        print(f"depth: rotation skipped: {e}", flush=True)
+
+
+def _run_pool_probe():
+    try:
+        import new_pool_probe
+        new_pool_probe.main()
+    except Exception as e:
+        print(f"depth: pool probe skipped: {e}", flush=True)
+
+
+if __name__ == '__main__':
+    _run_pool_probe()
