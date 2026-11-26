@@ -144,9 +144,13 @@ def main():
             unsupported.append({'addr': addr, 'networkId': meta.get('networkId'),
                                 'pid': meta.get('pid'), 'symbol': meta.get('symbol')})
     depth = {}
+    # DexScreener echoes EVM addresses in checksum case; match case-insensitively or the
+    # position linkage is silently lost for every non-Solana token.
+    lower_map = {a.lower(): a for a in cands}
     for chain, addrs in by_chain.items():
         for addr, rec in fetch_depth(addrs, chain).items():
-            rec.update(cands.get(addr) or {})
+            canon = addr if addr in cands else lower_map.get(addr.lower())
+            rec.update(cands.get(canon) or {})
             rec['chain'] = chain
             rec['impactBps100'] = cost_bps(rec['liqUsd'])
             depth[addr] = rec
