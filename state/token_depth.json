@@ -1,20 +1,34 @@
 {
  "4MMQY9bwkxxTtsK3W227Q5ABT6yFY8Pmn9Ze7wmAXKY8": {
-  "at": 1795680864,
+  "at": 1795681209,
+  "chain": "solana",
   "createdAt": 1789156938000,
+  "dexId": "raydium",
+  "holders": 8,
   "impactBps100": 21.2,
   "liqUsd": 94405.91,
+  "majorityShare": null,
+  "memberCount": 0,
   "pairs": 1,
   "priceUsd": "0.0008727",
+  "source": "majority",
+  "symbol": "ALLINU",
   "vol24h": 11599.03
  },
  "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": {
-  "at": 1795680864,
+  "at": 1795681209,
+  "chain": "solana",
   "createdAt": 1760844415000,
+  "dexId": "orca",
+  "holders": 8,
   "impactBps100": 0.9,
-  "liqUsd": 2116393.45,
+  "liqUsd": 2116929.94,
+  "majorityShare": null,
+  "memberCount": 0,
   "pairs": 1,
-  "priceUsd": "745.18",
-  "vol24h": 3577669.28
+  "priceUsd": "745.36",
+  "source": "majority",
+  "symbol": "ZEC",
+  "vol24h": 3577735.09
  }
 }
