@@ -1,20 +1,20 @@
 {
  "4MMQY9bwkxxTtsK3W227Q5ABT6yFY8Pmn9Ze7wmAXKY8": {
-  "at": 1795680775,
+  "at": 1795680864,
   "createdAt": 1789156938000,
-  "impactBps100": 20.7,
-  "liqUsd": 96832.69,
+  "impactBps100": 21.2,
+  "liqUsd": 94405.91,
   "pairs": 1,
-  "priceUsd": "0.0009135",
-  "vol24h": 10604.82
+  "priceUsd": "0.0008727",
+  "vol24h": 11599.03
  },
  "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS": {
-  "at": 1795680775,
+  "at": 1795680864,
   "createdAt": 1760844415000,
   "impactBps100": 0.9,
-  "liqUsd": 2111128.1,
+  "liqUsd": 2116393.45,
   "pairs": 1,
-  "priceUsd": "743.10",
-  "vol24h": 3574546.09
+  "priceUsd": "745.18",
+  "vol24h": 3577669.28
  }
 }
