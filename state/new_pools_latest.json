@@ -1,17 +1,29 @@
 {
- "at": 1795781109.3686264,
+ "at": 1795813843.7343287,
  "pools": {
-  "14sLnNVK7i6yA1Z5J5xzK2xR4EaADrAm5fwgwVL5zsXX": {
-   "ageH": 0.04,
-   "buys24h": 41,
-   "createdAt": "2026-11-27T12:02:56Z",
-   "pool": "14sLnNVK7i6yA1Z5J5xzK2xR4EaADrAm5fwgwVL5zsXX",
-   "priceUsd": "0.0000151747139445350436826505892782303960663958931193643389657476938",
-   "reserveUsd": 29801.0,
-   "sells24h": 3,
+  "8pnB4M2i6VJ8HLqctdEbgnCjLzAtZaaV3ok5xAR6dQvX": {
+   "ageH": 0.02,
+   "buys24h": 16,
+   "createdAt": "2026-11-27T21:09:32Z",
+   "pool": "8pnB4M2i6VJ8HLqctdEbgnCjLzAtZaaV3ok5xAR6dQvX",
+   "priceUsd": "0.00000488012221751908969850338015228588684920386239263675521266586166",
+   "reserveUsd": 8666.0,
+   "sells24h": 1,
    "symbol": "",
    "token": "",
-   "vol24h": 297.0
+   "vol24h": 428.0
+  },
+  "DEhCq3PdGGN95m28q2AbdpvdYLsWgpmALwYuEMHUKwET": {
+   "ageH": 0.02,
+   "buys24h": 18,
+   "createdAt": "2026-11-27T21:09:25Z",
+   "pool": "DEhCq3PdGGN95m28q2AbdpvdYLsWgpmALwYuEMHUKwET",
+   "priceUsd": "0.00000193076552016830712443581361360184674210672228416226267505999408",
+   "reserveUsd": 5878.0,
+   "sells24h": 9,
+   "symbol": "",
+   "token": "",
+   "vol24h": 160.0
   }
  }
 }
